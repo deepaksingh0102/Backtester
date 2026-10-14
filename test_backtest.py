@@ -333,6 +333,65 @@ check("DMA: no entries on a flat series",
 check("DMA: displaced crossover fires no later than plain EMA crossover",
       _dma_entries.idxmax() <= _ema_entries.idxmax())
 
+# --- Intraday: opening-range breakout ----------------------------------------
+def _session_bars(day, rows):
+    """rows: (time 'HH:MM', O, H, L, C)."""
+    idx = [pd.Timestamp(day) + pd.Timedelta(hours=int(t[:2]),
+                                            minutes=int(t[3:]))
+           for t, _, _, _, _ in rows]
+    return pd.DataFrame(
+        [(o, h, l, c) for _, o, h, l, c in rows],
+        columns=["Open", "High", "Low", "Close"], index=idx)
+
+
+or_df = pd.concat([
+    _session_bars("2024-01-02", [
+        ("09:30", 100, 100, 99, 100), ("09:35", 100, 101, 99.5, 100.5),
+        ("09:40", 100.5, 100.5, 99.8, 100), ("09:45", 100, 100, 99, 99.5),
+        ("09:50", 99.5, 100, 99, 100), ("09:55", 100, 101, 99.5, 100.5),
+        ("10:00", 100.5, 100.8, 100, 100.7),
+        ("10:05", 100.7, 102, 100.5, 101.5),
+        ("10:10", 101.5, 101.8, 101, 101.2),
+    ]),
+    _session_bars("2024-01-03", [
+        ("09:30", 100, 100, 99, 100), ("09:35", 100, 100, 99.5, 99.8),
+        ("09:40", 99.8, 100, 99.5, 99.9), ("09:45", 99.9, 100, 99, 99.5),
+        ("09:50", 99.5, 100, 99, 99.8), ("09:55", 99.8, 100, 99.5, 99.9),
+        ("10:00", 99.9, 99.9, 99, 99),
+    ]),
+])
+or_df["Volume"] = 100_000
+or_sig = strategies.or_breakout(or_df, or_minutes=30)
+check("OR breakout: fires on the first close above the OR high",
+      bool(or_sig["entry"].iloc[7]) and or_sig["entry"].sum() == 1)
+check("OR breakout: no entry before the OR completes",
+      not or_sig["entry"].iloc[:6].any())
+check("OR breakout: no entry when price never breaks the OR high",
+      not or_sig["entry"].iloc[9:].any())
+
+# --- Engine: session-end close (intraday) -------------------------------------
+dfS = bars([(100, 101, 99, 100), (101, 102, 100, 101),
+            (102, 103, 101, 102), (103, 104, 102, 103)])
+sess = pd.Series([False, True, False, True], index=dfS.index)
+resS = engine.run_backtest(
+    dfS, sig([True, False, False, False], dfS.index),
+    sig([False, False, False, False], dfS.index),
+    stop_pct=50, commission=0.0, slippage_pct=0.0, position_size=10_000,
+    session_ends=sess)
+tS = resS["trades"]
+check("engine: session end closes the position at the close",
+      len(tS) == 1 and tS[0]["reason"] == "session_end"
+      and tS[0]["exit_price"] == 101)
+
+# --- Data: demo intraday -------------------------------------------------------
+di = data.demo_intraday("DEMO", days=2, timeframe_minutes=5)
+check("demo intraday: 2 days x 78 five-minute bars",
+      len(di) == 156 and isinstance(di.index, pd.DatetimeIndex))
+di_mins = di.index.hour * 60 + di.index.minute
+check("demo intraday: regular session only (09:30-16:00)",
+      di_mins.min() >= 570 and di_mins.max() < 960)
+check("demo intraday: first bar at 09:30", di_mins[0] == 570)
+
 # --- Data ---------------------------------------------------------------------
 demo = data.demo_daily()
 check("data: demo bars OHLC-consistent",
