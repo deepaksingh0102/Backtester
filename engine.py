@@ -10,6 +10,12 @@ Execution model (no lookahead):
   receive price * (1 - slip). Commission is charged per side.
 
 Position sizing: fixed $ per trade (no compounding, no leverage).
+
+Stops: fixed % (stop_pct below entry) or ATR multiple
+(stop = entry - atr_mult * ATR). An ATR stop is fixed at entry from the
+PRIOR bar's ATR — the entry bar's ATR needs that bar's close, so using it
+would be lookahead. If the ATR is missing / non-positive (warm-up), the
+stop falls back to the fixed % stop.
 """
 import numpy as np
 import pandas as pd
@@ -19,7 +25,9 @@ def run_backtest(df: pd.DataFrame, entry: pd.Series, exit_: pd.Series,
                  max_holding_bars: int | None = None,
                  stop_pct: float = 5.0, commission: float = 0.0,
                  slippage_pct: float = 0.05, capital: float = 100_000.0,
-                 position_size: float = 10_000.0) -> dict:
+                 position_size: float = 10_000.0,
+                 atr: pd.Series | None = None,
+                 stop_mode: str = "pct", atr_mult: float = 2.0) -> dict:
     n = len(df)
     opens = df["Open"].to_numpy(float)
     highs = df["High"].to_numpy(float)
@@ -28,6 +36,14 @@ def run_backtest(df: pd.DataFrame, entry: pd.Series, exit_: pd.Series,
     entry_sig = entry.to_numpy(bool)
     exit_sig = exit_.to_numpy(bool)
     slip = slippage_pct / 100.0
+    atr_arr = atr.to_numpy(float) if atr is not None else None
+
+    def stop_price_for(entry_price: float, entry_idx: int) -> float:
+        if stop_mode == "atr" and atr_arr is not None and entry_idx > 0:
+            prior_atr = atr_arr[entry_idx - 1]
+            if np.isfinite(prior_atr) and prior_atr > 0:
+                return entry_price - atr_mult * prior_atr
+        return entry_price * (1 - stop_pct / 100.0)
 
     trades = []
     equity = np.full(n, capital, dtype=float)
@@ -64,11 +80,12 @@ def run_backtest(df: pd.DataFrame, entry: pd.Series, exit_: pd.Series,
         if pending_entry and position is None:
             fill = opens[i] * (1 + slip)
             position = {"entry_idx": i, "entry_price": fill,
-                        "shares": position_size / fill}
+                        "shares": position_size / fill,
+                        "stop_price": stop_price_for(fill, i)}
             pending_entry = False
         # 3) In-position checks on this bar: stop, then time exit.
         if position is not None:
-            stop_price = position["entry_price"] * (1 - stop_pct / 100.0)
+            stop_price = position["stop_price"]
             if lows[i] <= stop_price:
                 close_trade(i, stop_price * (1 - slip), "stop")
             elif (max_holding_bars is not None
