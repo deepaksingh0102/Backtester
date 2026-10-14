@@ -113,3 +113,88 @@ def load_daily(symbol: str, start: date, end: date,
         except Exception:
             pass  # fall through to Yahoo on any Alpaca failure
     return fetch_daily_yahoo(symbol, start, end)
+
+
+def fetch_intraday_alpaca(symbol: str, start: date, end: date,
+                          timeframe: str = "5Min") -> pd.DataFrame:
+    """Intraday bars from Alpaca (1Min / 5Min / 15Min). Paginates with
+    next_page_token (limit 10000/page) so long ranges come back whole.
+    Filtered to the regular session 09:30-16:00 ET, naive ET index."""
+    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": timeframe,
+        "start": f"{start.isoformat()}T00:00:00Z",
+        "end": f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
+        "limit": 10000,
+        "feed": _alpaca_feed(),
+        "adjustment": "raw",
+        "sort": "asc",
+    }
+    all_bars = []
+    for _ in range(20):  # safety cap: 20 pages = 200k bars
+        r = requests.get(url, headers=_alpaca_headers(), params=params,
+                         timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        all_bars.extend(payload.get("bars") or [])
+        token = payload.get("next_page_token")
+        if not token:
+            break
+        params["page_token"] = token
+    if not all_bars:
+        return pd.DataFrame()
+    df = pd.DataFrame([{
+        "time": b["t"],
+        "Open": b["o"], "High": b["h"], "Low": b["l"],
+        "Close": b["c"], "Volume": b["v"],
+    } for b in all_bars])
+    # Alpaca timestamps are UTC; convert to ET, keep regular session only.
+    et = pd.to_datetime(df["time"]).dt.tz_convert("America/New_York")
+    mins = et.dt.hour * 60 + et.dt.minute
+    df = df[(mins >= 570) & (mins < 960)]  # 09:30 <= t < 16:00 ET
+    et = et.loc[df.index]
+    df = df.drop(columns=["time"])
+    df.index = et.dt.tz_localize(None)
+    return (df.sort_index()[["Open", "High", "Low", "Close", "Volume"]])
+
+
+def demo_intraday(symbol: str = "DEMO", days: int = 20,
+                  timeframe_minutes: int = 5) -> pd.DataFrame:
+    """Deterministic synthetic intraday bars (random walk) for offline use.
+    Regular session only, 09:30-16:00 ET, `days` recent business days."""
+    import numpy as np
+    rng = np.random.default_rng(42)
+    bars_per_day = 390 // timeframe_minutes
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=days)
+    idx = []
+    for d in dates:
+        base = d + pd.Timedelta(hours=9, minutes=30)
+        for i in range(bars_per_day):
+            idx.append(base + pd.Timedelta(minutes=i * timeframe_minutes))
+    n = len(idx)
+    rets = rng.normal(0.0002, 0.0015, n)
+    close = 100 * np.exp(np.cumsum(rets))
+    open_ = np.empty(n)
+    open_[0] = close[0] - 0.05
+    open_[1:] = close[:-1] + rng.normal(0, 0.03, n - 1)
+    high = np.maximum(open_, close) + np.abs(rng.normal(0, 0.05, n))
+    low = np.minimum(open_, close) - np.abs(rng.normal(0, 0.05, n))
+    return pd.DataFrame(
+        {"Open": open_, "High": high, "Low": low, "Close": close,
+         "Volume": rng.integers(50_000, 500_000, n)},
+        index=pd.DatetimeIndex(idx))
+
+
+def load_intraday(symbol: str, start: date, end: date,
+                  timeframe: str = "5Min",
+                  use_demo: bool = False) -> pd.DataFrame:
+    """Intraday bars. Alpaca is required (Yahoo intraday is capped at ~60
+    days and unreliable) — returns an empty frame when Alpaca is not
+    configured and demo is off; the app shows the keys message."""
+    if use_demo:
+        mins = {"1Min": 1, "5Min": 5, "15Min": 15}[timeframe]
+        df = demo_intraday(symbol, days=60, timeframe_minutes=mins)
+        return df[(df.index.date >= start) & (df.index.date <= end)]
+    if alpaca_is_configured():
+        return fetch_intraday_alpaca(symbol, start, end, timeframe)
+    return pd.DataFrame()
