@@ -349,6 +349,42 @@ def dma_crossover(df: pd.DataFrame, fast: int = 9, slow: int = 21,
             "max_holding_bars": None, "describe": desc}
 
 
+def or_breakout(df: pd.DataFrame, or_minutes: int = 30,
+                adx_min: float | None = None) -> dict:
+    """True intraday opening-range breakout: buy when the close breaks
+    above the high of the first `or_minutes` minutes of the session
+    (09:30 ET + or_minutes). Exit at the session close (the engine closes
+    positions at each session end) or on stop. Intraday only — on daily
+    bars the index has no intraday times, so it never fires."""
+    mins = df.index.hour * 60 + df.index.minute
+    dates = pd.Series(df.index.date, index=df.index)
+    in_or = (mins >= 570) & (mins < 570 + or_minutes)
+    after_or = mins >= 570 + or_minutes
+    # Session OR high, broadcast to every bar of that session. Only bars
+    # AFTER the OR completes can enter, so the OR high is fully known
+    # at every entry bar — no lookahead.
+    or_high = df["High"].where(in_or).groupby(dates).transform("max")
+    same_session = dates == dates.shift(1)
+    entry = (after_or & same_session
+             & (df["Close"].shift(1) <= or_high.shift(1))
+             & (df["Close"] > or_high))
+    entry = _adx_filter(df, entry, adx_min)
+    exit_ = pd.Series(False, index=df.index)
+    desc = (f"Intraday opening-range breakout: buy when the close breaks "
+            f"above the high of the first {or_minutes} minutes "
+            f"(09:30-{_fmt_or_end(or_minutes)} ET). Exit at the session "
+            f"close or on stop.")
+    if adx_min is not None:
+        desc += f" Entries only when ADX >= {adx_min:g}."
+    return {"entry": entry.fillna(False), "exit": exit_,
+            "max_holding_bars": None, "describe": desc}
+
+
+def _fmt_or_end(or_minutes: int) -> str:
+    total = 9 * 60 + 30 + or_minutes
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
 STRATEGIES = {
     "EMA 9/21 crossover": ema_crossover,
     "RSI mean-reversion": rsi_reversion,
@@ -361,4 +397,5 @@ STRATEGIES = {
     "Moving averages + ATR": keltner_breakout,
     "VWAP + Bollinger": vwap_bollinger,
     "SMA/EMA + DMA": dma_crossover,
+    "Opening-range breakout": or_breakout,
 }
