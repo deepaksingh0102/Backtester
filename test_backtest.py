@@ -177,6 +177,66 @@ check("strategy: breakout fires on close above prior high",
 check("strategy: breakout is a 1-day hold",
       bo_sig["max_holding_bars"] == 1)
 
+# --- ADX ----------------------------------------------------------------------
+trend = pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close":
+                      list(np.linspace(100, 160, 40))},
+                     index=pd.bdate_range("2024-01-01", periods=40))
+trend["High"] = trend["Close"] + 1.0
+trend["Low"] = trend["Close"] - 1.0
+check("ADX: strong trend reads above 25",
+      strategies.adx(trend["High"], trend["Low"], trend["Close"]).iloc[-1] > 25)
+check("ADX: flat series is NaN (no trend to measure)",
+      strategies.adx(flat["High"], flat["Low"], flat["Close"]).isna().all())
+check("ADX filter: impossible threshold blocks all entries",
+      not strategies.ema_crossover(down_up, adx_min=100)["entry"].any())
+_f0 = strategies.ema_crossover(down_up, adx_min=0)["entry"]
+_fu = strategies.ema_crossover(down_up)["entry"]
+check("ADX filter: zero threshold only blocks warm-up bars",
+      not _f0.iloc[:26].any() and _f0.iloc[30:].equals(_fu.iloc[30:]))
+
+# --- Volume confirmation (breakout) ------------------------------------------
+vol = pd.DataFrame(
+    {"Open": [100, 100, 100, 100, 100], "High": [100, 100, 105, 106, 110],
+     "Low": [100, 100, 100, 100, 100], "Close": [100, 100, 105, 106, 110],
+     "Volume": [1_000_000, 1_000_000, 500_000, 1_000_000, 3_000_000]},
+    index=pd.bdate_range("2024-01-01", periods=5))
+vol_sig = strategies.prior_high_breakout(vol, vol_mult=1.5, vol_window=2)
+check("volume filter: low-volume breakout skipped, high-volume kept",
+      not vol_sig["entry"].iloc[2] and not vol_sig["entry"].iloc[3]
+      and bool(vol_sig["entry"].iloc[4]))
+check("volume filter: off means every breakout fires",
+      strategies.prior_high_breakout(vol)["entry"].iloc[2:].all())
+
+# --- ATR + ATR stop ------------------------------------------------------------
+const = pd.DataFrame({"Open": 100.0, "High": 100.0, "Low": 100.0,
+                      "Close": 100.0},
+                     index=pd.bdate_range("2024-01-01", periods=30))
+check("ATR: flat series reads 0 after warm-up",
+      strategies.atr(const["High"], const["Low"], const["Close"]).iloc[-1] == 0)
+# ATR stop: entry at open[1] = 101, prior-bar ATR = 2.0 -> stop 101 - 2*2 = 97.
+# Bar 2 low (90) hits both the ATR stop (97) and the fallback stop (95.95).
+dfATR = bars([(100, 101, 99, 100), (101, 102, 100, 101), (102, 103, 90, 100),
+              (98, 99, 97, 98)])
+atr_series = pd.Series([2.0] * 4, index=dfATR.index)
+resATR = engine.run_backtest(
+    dfATR, sig([True, False, False, False], dfATR.index),
+    sig([False, False, False, False], dfATR.index),
+    stop_pct=5.0, commission=0.0, slippage_pct=0.0, position_size=10_000,
+    atr=atr_series, stop_mode="atr", atr_mult=2.0)
+tATR = resATR["trades"]
+check("ATR stop: exits at entry - 2x prior-bar ATR",
+      tATR and tATR[0]["reason"] == "stop" and tATR[0]["exit_price"] == 97.0)
+# ATR fallback: all-NaN ATR -> fixed % stop (101 * 0.95 = 95.95).
+nan_atr = pd.Series([float("nan")] * 4, index=dfATR.index)
+resFB = engine.run_backtest(
+    dfATR, sig([True, False, False, False], dfATR.index),
+    sig([False, False, False, False], dfATR.index),
+    stop_pct=5.0, commission=0.0, slippage_pct=0.0, position_size=10_000,
+    atr=nan_atr, stop_mode="atr", atr_mult=2.0)
+tFB = resFB["trades"]
+check("ATR stop: missing ATR falls back to fixed % stop",
+      tFB and tFB[0]["reason"] == "stop" and tFB[0]["exit_price"] == 95.95)
+
 # --- Data ---------------------------------------------------------------------
 demo = data.demo_daily()
 check("data: demo bars OHLC-consistent",
