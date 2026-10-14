@@ -11,6 +11,10 @@ Execution model (no lookahead):
 
 Position sizing: fixed $ per trade (no compounding, no leverage).
 
+Session ends (intraday): pass session_ends (True on the last bar of each
+session) and open positions close at that bar's close with reason
+"session_end" — no overnight holds. Daily backtests pass None.
+
 Stops: fixed % (stop_pct below entry) or ATR multiple
 (stop = entry - atr_mult * ATR). An ATR stop is fixed at entry from the
 PRIOR bar's ATR — the entry bar's ATR needs that bar's close, so using it
@@ -27,7 +31,8 @@ def run_backtest(df: pd.DataFrame, entry: pd.Series, exit_: pd.Series,
                  slippage_pct: float = 0.05, capital: float = 100_000.0,
                  position_size: float = 10_000.0,
                  atr: pd.Series | None = None,
-                 stop_mode: str = "pct", atr_mult: float = 2.0) -> dict:
+                 stop_mode: str = "pct", atr_mult: float = 2.0,
+                 session_ends: pd.Series | None = None) -> dict:
     n = len(df)
     opens = df["Open"].to_numpy(float)
     highs = df["High"].to_numpy(float)
@@ -37,6 +42,8 @@ def run_backtest(df: pd.DataFrame, entry: pd.Series, exit_: pd.Series,
     exit_sig = exit_.to_numpy(bool)
     slip = slippage_pct / 100.0
     atr_arr = atr.to_numpy(float) if atr is not None else None
+    sess_arr = (session_ends.to_numpy(bool) if session_ends is not None
+                else None)
 
     def stop_price_for(entry_price: float, entry_idx: int) -> float:
         if stop_mode == "atr" and atr_arr is not None and entry_idx > 0:
@@ -83,11 +90,14 @@ def run_backtest(df: pd.DataFrame, entry: pd.Series, exit_: pd.Series,
                         "shares": position_size / fill,
                         "stop_price": stop_price_for(fill, i)}
             pending_entry = False
-        # 3) In-position checks on this bar: stop, then time exit.
+        # 3) In-position checks on this bar: stop, then session end,
+        # then time exit.
         if position is not None:
             stop_price = position["stop_price"]
             if lows[i] <= stop_price:
                 close_trade(i, stop_price * (1 - slip), "stop")
+            if position is not None and sess_arr is not None and sess_arr[i]:
+                close_trade(i, closes[i], "session_end")
             elif (max_holding_bars is not None
                     and i == position["entry_idx"] + max_holding_bars - 1):
                 close_trade(i, closes[i] * (1 - slip), "time")
