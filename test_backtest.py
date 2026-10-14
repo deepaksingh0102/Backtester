@@ -237,6 +237,102 @@ tFB = resFB["trades"]
 check("ATR stop: missing ATR falls back to fixed % stop",
       tFB and tFB[0]["reason"] == "stop" and tFB[0]["exit_price"] == 95.95)
 
+# --- New indicator combos -----------------------------------------------------
+# VWAP: constant volume -> VWAP = mean of typical prices over the window.
+vwap_df = pd.DataFrame(
+    {"Open": [100, 102, 104], "High": [100, 102, 104], "Low": [100, 102, 104],
+     "Close": [100, 102, 104], "Volume": [1000, 1000, 1000]},
+    index=pd.bdate_range("2024-01-01", periods=3))
+check("VWAP: constant volume = mean of typical prices",
+      strategies.vwap(vwap_df["Close"], vwap_df["High"], vwap_df["Low"],
+                      vwap_df["Volume"], 3).iloc[-1] == 102.0)
+# MACD: flat series -> zero line and histogram; uptrend -> positive line.
+check("MACD: flat series = zero line and histogram",
+      all(strategies.macd(flat["Close"])[i].iloc[-1] == 0 for i in (0, 2)))
+check("MACD: uptrend line positive",
+      strategies.macd(trend["Close"])[0].iloc[-1] > 0)
+# Bollinger: flat series -> bands collapse to the price.
+_mid, _up, _lo = strategies.bollinger(flat["Close"], 5, 2.0)
+check("Bollinger: flat series bands collapse to the price",
+      _mid.iloc[-1] == _up.iloc[-1] == _lo.iloc[-1])
+# Spike: 24 flat bars then a +30 gap — breaches Bollinger upper, Keltner
+# upper, and sits above VWAP. Drop: 20 flat bars then a -30 gap — below
+# lower Bollinger with RSI oversold.
+spike = pd.DataFrame(
+    {"Open": [100.0]*24 + [130.0], "High": [100.0]*24 + [130.0],
+     "Low": [100.0]*24 + [130.0], "Close": [100.0]*24 + [130.0],
+     "Volume": [1_000_000]*25},
+    index=pd.bdate_range("2024-01-01", periods=25))
+drop = pd.DataFrame(
+    {"Open": [100.0]*20 + [70.0], "High": [100.0]*20 + [70.0],
+     "Low": [100.0]*20 + [70.0], "Close": [100.0]*20 + [70.0],
+     "Volume": [1_000_000]*21},
+    index=pd.bdate_range("2024-01-01", periods=21))
+check("Bollinger breakout: gap-up breach fires an entry",
+      bool(strategies.bollinger_breakout(spike)["entry"].iloc[-1]))
+check("Keltner (MA+ATR): gap-up breach fires an entry",
+      bool(strategies.keltner_breakout(spike)["entry"].iloc[-1]))
+check("VWAP + Bollinger: gap-up breach above VWAP fires an entry",
+      bool(strategies.vwap_bollinger(spike)["entry"].iloc[-1]))
+check("Bollinger + RSI: gap-down breach with RSI oversold fires an entry",
+      bool(strategies.bollinger_rsi(drop)["entry"].iloc[-1]))
+# VWAP + Volume: 3-bar hand case — close crosses above VWAP (105) on the
+# third bar; high volume passes, low volume fails.
+vv = pd.DataFrame(
+    {"Open": [100, 100, 100], "High": [100, 100, 110], "Low": [100, 100, 100],
+     "Close": [100, 100, 110], "Volume": [1_000_000, 1_000_000, 3_000_000]},
+    index=pd.bdate_range("2024-01-01", periods=3))
+check("VWAP + Volume: high-volume VWAP cross fires",
+      bool(strategies.vwap_volume(vv, vwap_window=2, vol_mult=1.5,
+                                   vol_window=2)["entry"].iloc[-1]))
+vv_low = vv.copy()
+vv_low.loc[vv_low.index[-1], "Volume"] = 1_000_000
+check("VWAP + Volume: low-volume VWAP cross does not fire",
+      not strategies.vwap_volume(vv_low, vwap_window=2, vol_mult=1.5,
+                                  vol_window=2)["entry"].iloc[-1])
+# EMA + Volume on a down-then-up series with volume.
+du_vol = pd.DataFrame(
+    {"Open": 1.0, "High": 1.0, "Low": 1.0,
+     "Close": list(np.linspace(100, 80, 20)) + list(np.linspace(82, 120, 20)),
+     "Volume": [1_000_000]*40},
+    index=pd.bdate_range("2024-01-01", periods=40))
+du_vol["High"] = du_vol["Close"] + 1.0
+du_vol["Low"] = du_vol["Close"] - 1.0
+check("EMA + Volume: impossible volume threshold blocks all entries",
+      not strategies.ema_crossover(du_vol, vol_mult=100)["entry"].any())
+_ev = strategies.ema_crossover(du_vol, vol_mult=1.5)
+_fast = strategies.ema(du_vol["Close"], 9)
+_slow = strategies.ema(du_vol["Close"], 21)
+_cross = (_fast.shift(1) <= _slow.shift(1)) & (_fast > _slow)
+_avg = du_vol["Volume"].rolling(20, min_periods=20).mean().shift(1)
+_vol = (du_vol["Volume"] > 1.5 * _avg).fillna(False)
+check("EMA + Volume: entries are crossovers passing the volume test",
+      not (_ev["entry"] & ~(_cross & _vol)).any())
+# RSI + MACD: window=0 reproduces the strict same-bar version.
+_r = strategies.rsi(down_up["Close"])
+_, _, _hist = strategies.macd(down_up["Close"])
+_rec = (_r.shift(1) < 30) & (_r >= 30)
+_strict = _rec & (_hist > 0).fillna(False)
+check("RSI + MACD: window 0 = strict same-bar version",
+      strategies.rsi_macd(down_up, confirm_window=0)["entry"].equals(
+          _strict.fillna(False)))
+# RSI + MACD invariant (window 3): every entry has an RSI recovery AND a
+# positive MACD histogram within the last 3 bars.
+_rm3 = strategies.rsi_macd(down_up, confirm_window=3)
+_rsi_recent = _rec.rolling(4, min_periods=1).max() > 0
+_hist_recent = (_hist > 0).fillna(False).rolling(4, min_periods=1).max() > 0
+check("RSI + MACD: entries have both signals within 3 bars",
+      not (_rm3["entry"] & ~(_rsi_recent & _hist_recent)).any())
+# DMA: fires on a trend reversal, nothing on flat, and the displaced line
+# crosses no later than the plain slow EMA (it sits lower in an uptrend).
+_dma_entries = strategies.dma_crossover(down_up)["entry"]
+_ema_entries = strategies.ema_crossover(down_up)["entry"]
+check("DMA: crossover fires on a trend reversal", _dma_entries.any())
+check("DMA: no entries on a flat series",
+      not strategies.dma_crossover(flat)["entry"].any())
+check("DMA: displaced crossover fires no later than plain EMA crossover",
+      _dma_entries.idxmax() <= _ema_entries.idxmax())
+
 # --- Data ---------------------------------------------------------------------
 demo = data.demo_daily()
 check("data: demo bars OHLC-consistent",
