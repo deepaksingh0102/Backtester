@@ -24,8 +24,6 @@ with st.sidebar:
 
     st.header("Strategy")
     strat_name = st.selectbox("Strategy", list(strategies.STRATEGIES))
-    stop_pct = st.number_input("Stop-loss %", min_value=0.0, max_value=50.0,
-                               value=float(config.DEFAULT_STOP_PCT), step=0.5)
     if strat_name == "EMA 9/21 crossover":
         fast = st.number_input("Fast EMA", min_value=2, max_value=100, value=9)
         slow = st.number_input("Slow EMA", min_value=3, max_value=200, value=21)
@@ -39,6 +37,37 @@ with st.sidebar:
                         "exit_level": float(exit_level)}
     else:
         strat_kwargs = {}
+    if strat_name == "Prior-day high breakout":
+        vol_mult = st.number_input("Volume confirm (x 20-day avg, 0 = off)",
+                                   min_value=0.0, max_value=10.0, value=1.5,
+                                   step=0.1)
+        strat_kwargs["vol_mult"] = float(vol_mult) if vol_mult > 0 else None
+
+    st.header("Filters & stops")
+    use_adx = st.checkbox("ADX filter — enter only when ADX >= threshold",
+                          value=False,
+                          help="Meant for trend strategies (EMA crossover, "
+                               "breakout). It will also filter RSI entries "
+                               "if left on — the backtest shows the effect.")
+    adx_min = st.number_input("Min ADX", min_value=0.0, max_value=100.0,
+                              value=25.0, step=1.0) if use_adx else None
+    if adx_min is not None:
+        strat_kwargs["adx_min"] = float(adx_min)
+    stop_mode = st.selectbox("Stop type", ["Fixed %", "ATR multiple"],
+                             help="ATR stops adapt to each stock's actual "
+                                  "volatility: stop = entry - multiple x ATR "
+                                  "(prior bar, fixed at entry).")
+    if stop_mode == "ATR multiple":
+        atr_mult = st.number_input("ATR multiple", min_value=0.5, max_value=10.0,
+                                   value=2.0, step=0.25)
+        atr_period = st.number_input("ATR period", min_value=5, max_value=50,
+                                     value=14)
+        stop_pct = float(config.DEFAULT_STOP_PCT)  # fallback if ATR missing
+    else:
+        atr_mult, atr_period = 2.0, 14
+        stop_pct = st.number_input("Stop-loss %", min_value=0.0, max_value=50.0,
+                                   value=float(config.DEFAULT_STOP_PCT),
+                                   step=0.5)
 
     st.header("Costs & sizing")
     commission = st.number_input("Commission $ / side", min_value=0.0,
@@ -71,13 +100,21 @@ if df.empty:
     st.stop()
 
 sig = strategies.STRATEGIES[strat_name](df, **strat_kwargs)
+atr_series = None
+if stop_mode == "ATR multiple":
+    atr_series = strategies.atr(df["High"], df["Low"], df["Close"],
+                                int(atr_period))
 res = engine.run_backtest(df, sig["entry"], sig["exit"],
                           max_holding_bars=sig["max_holding_bars"],
                           stop_pct=float(stop_pct),
                           commission=float(commission),
                           slippage_pct=float(slippage),
                           capital=float(capital),
-                          position_size=float(position))
+                          position_size=float(position),
+                          atr=atr_series,
+                          stop_mode=("atr" if stop_mode == "ATR multiple"
+                                     else "pct"),
+                          atr_mult=float(atr_mult))
 m = res["metrics"]
 trades = res["trades"]
 
@@ -86,8 +123,11 @@ st.caption(f"{symbol} · {len(df)} daily bars · "
            f"Source: {'demo' if use_demo else ('Alpaca' if data.alpaca_is_configured() else 'Yahoo')}")
 st.subheader(f"{strat_name} — {symbol}")
 st.write(sig["describe"])
+stop_desc = (f"Stop: {atr_mult:g}x ATR({int(atr_period)}) (prior bar, fixed "
+             f"at entry; falls back to {stop_pct:g}% if ATR missing)"
+             if stop_mode == "ATR multiple" else f"Stop {stop_pct:g}%")
 st.write(f"Execution: signals fill at the NEXT bar's open. Stops fill intrabar "
-         f"at the stop price. Stop {stop_pct:g}% · commission "
+         f"at the stop price. {stop_desc} · commission "
          f"${commission:g}/side · slippage {slippage:g}%/fill · "
          f"fixed ${position:g} per trade, one position at a time.")
 
