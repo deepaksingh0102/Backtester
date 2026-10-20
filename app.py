@@ -205,9 +205,14 @@ def _load(symbol, start, end, use_demo, nonce, bar_size):
 if not symbol:
     st.info("Type a symbol in the sidebar to begin.")
     st.stop()
-if start >= end:
-    st.warning("Start date must be before end date.")
+if start > end:
+    st.warning("Start date must be on or before the end date.")
     st.stop()
+if start == end and strat_name == "Price-action breakout":
+    st.info("Single-day window: the Price-action breakout builds its volume "
+            "baseline from prior sessions inside the loaded window, so no "
+            "entries can fire on a one-day range. Start earlier to test it "
+            "(entries only come once ~10 prior sessions are loaded).")
 
 df = _load(symbol, start, end, use_demo, 0, bar_size)
 if df.empty:
