@@ -84,6 +84,16 @@ def macd(close: pd.Series, fast: int = 12, slow: int = 26,
     return line, sig, line - sig
 
 
+def stochastic(high: pd.Series, low: pd.Series, close: pd.Series,
+               k_period: int = 14, d_period: int = 3) -> tuple:
+    """Stochastic %K / %D — the price-action book's momentum-shift gauge.
+    Same math as the screener's stoch_kd."""
+    ll = low.rolling(k_period, min_periods=k_period).min()
+    hh = high.rolling(k_period, min_periods=k_period).max()
+    pk = 100.0 * (close - ll) / (hh - ll).replace(0.0, float("nan"))
+    return pk, pk.rolling(d_period, min_periods=d_period).mean()
+
+
 def bollinger(close: pd.Series, period: int = 20,
               num_std: float = 2.0) -> tuple:
     """Returns (middle SMA, upper band, lower band). Uses population
@@ -380,6 +390,124 @@ def or_breakout(df: pd.DataFrame, or_minutes: int = 30,
             "max_holding_bars": None, "describe": desc}
 
 
+def pa_breakout(df: pd.DataFrame, relvol_min: float = 1.5,
+                rsi_lo: float = 30.0, rsi_hi: float = 70.0,
+                wick_max: float = 0.5, or_minutes: int = 30,
+                cross_window: int = 30, stoch_window: int = 5,
+                adx_min: float | None = None) -> dict:
+    """Price-action breakout (the book's setup, same rules as the screener's
+    Breakout mode, long side — this engine is long-only). Intraday only.
+
+    Indicators are computed PER SESSION (session-only, like the live apps).
+    Levels: prior-day high (PDH, from the prior session in the loaded
+    frame) and the session's opening-range high (first `or_minutes`).
+
+    Entry — first bar where ALL hold: close crossed above PDH or the OR
+    high within the last `cross_window` bars and still holds it; the
+    crossing candle's upper wick <= `wick_max` of its range (the book's
+    false-breakout tell); EMA 9 > EMA 21; a stochastic %K/%D cross-up
+    within the last `stoch_window` bars or %K > 80; RSI inside the band;
+    relative volume (session cumulative vs the prior-20-session average
+    daily volume, prorated) >= relvol_min. If the PDH cross was
+    wick-rejected, an OR-high pass cannot rescue the bar (highest level
+    decides, as in the screener).
+
+    Exit — close back below PDH or the OR high, or a stochastic cross-down
+    (the book's momentum-shift exit). The engine also flattens at each
+    session end; pair with a % / ATR stop as a gap-through backstop — the
+    book's 'stop just below the level' is implemented as the level-failure
+    exit signal, since this engine's stops are % / ATR based.
+
+    The volume baseline needs >= 10 prior sessions in the loaded window,
+    so the first ~2 weeks of a run can never fire — load extra history.
+    On daily bars it never fires."""
+    import numpy as np
+    entry = pd.Series(False, index=df.index)
+    exit_ = pd.Series(False, index=df.index)
+    desc = (f"Price-action breakout (book rules): buy the first bar where "
+            f"the close has crossed the prior-day high or the {or_minutes}-"
+            f"minute opening-range high within {cross_window} bars, EMA "
+            f"9 > 21, stochastic crossed up within {stoch_window} bars or "
+            f"%K > 80, RSI in ({rsi_lo:g}, {rsi_hi:g}), relative volume "
+            f">= {relvol_min:g}x, and the crossing candle's upper wick "
+            f"<= {wick_max:.0%} of its range. Exit on a close back below "
+            f"the broken level or a stochastic cross-down; positions also "
+            f"close at each session end. Long-only (engine limit).")
+    if (df.index.hour == 0).all() and (df.index.minute == 0).all():
+        return {"entry": entry, "exit": exit_, "max_holding_bars": None,
+                "describe": desc}
+
+    day_key = pd.Series(df.index.date, index=df.index)
+    sess_high = df["High"].groupby(day_key).max()
+    sess_low = df["Low"].groupby(day_key).min()
+    sess_vol = df["Volume"].groupby(day_key).sum()
+    pdh_map = day_key.map(sess_high.shift(1))
+    avg_map = day_key.map(sess_vol.shift(1).rolling(20, min_periods=10)
+                          .mean())
+    diffs = (df.index.to_series().diff().dt.total_seconds().div(60))
+    within = diffs[day_key == day_key.shift(1)]
+    bar_minutes = float(within.median()) if len(within) else 1.0
+    if not np.isfinite(bar_minutes) or bar_minutes <= 0:
+        bar_minutes = 1.0
+
+    for _, g in df.groupby(day_key):
+        idx = g.index
+        o, h, l, c, v = (g["Open"], g["High"], g["Low"], g["Close"],
+                         g["Volume"])
+        e9, e21 = ema(c, 9), ema(c, 21)
+        r = rsi(c)
+        pk, pdv = stochastic(h, l, c)
+        mins = idx.hour * 60 + idx.minute
+        in_or = (mins >= 570) & (mins < 570 + or_minutes)
+        after_or = pd.Series(mins >= 570 + or_minutes, index=idx)
+        orh = h.where(in_or).max()
+        pdh = float(pdh_map.loc[idx].iloc[0])
+        avg_vol = float(avg_map.loc[idx].iloc[0])
+        elapsed = (mins - 570) + bar_minutes
+        relvol = v.cumsum() / (avg_vol * elapsed / 390.0)
+
+        def cross_info(level, mask_ok):
+            cu = ((c.shift(1) <= level) & (c > level) & mask_ok)
+            cd = (c.shift(1) >= level) & (c < level)
+            pos = np.arange(len(g))
+            last_pos = pd.Series(np.where(cu, pos, np.nan),
+                                 index=idx).ffill()
+            bars_since = pos - last_pos
+            rng = (h - l).replace(0, np.nan)
+            wick_up = (h - np.maximum(o, c)) / rng
+            cross_wick = pd.Series(np.where(cu, wick_up, np.nan),
+                                   index=idx).ffill()
+            return cd, bars_since, cross_wick
+
+        all_bars = pd.Series(True, index=idx)
+        cd_pdh, since_pdh, wick_pdh = cross_info(pdh, all_bars)
+        cd_orh, since_orh, wick_orh = cross_info(orh, after_or)
+
+        xup = (pk.shift(1) <= pdv.shift(1)) & (pk > pdv)
+        xdn = (pk.shift(1) >= pdv.shift(1)) & (pk < pdv)
+        stoch_ok = (xup.rolling(stoch_window, min_periods=1).max() > 0) \
+            | (pk > 80)
+
+        pdh_recent = since_pdh <= cross_window
+        pdh_path = (c > pdh) & pdh_recent & (wick_pdh <= wick_max)
+        pdh_veto = (c > pdh) & pdh_recent & (wick_pdh > wick_max)
+        orh_path = (c > orh) & (since_orh <= cross_window) \
+            & (wick_orh <= wick_max)
+        level_ok = pdh_path | (orh_path & ~pdh_veto)
+        gates = ((e9 > e21) & stoch_ok & (r > rsi_lo) & (r < rsi_hi)
+                 & (relvol >= relvol_min) & level_ok)
+        # fill_value=False keeps the shifted series bool — a plain shift
+        # upcasts to float and ~ would silently stop suppressing re-fires.
+        entry.loc[idx] = gates & ~gates.shift(1, fill_value=False)
+        exit_.loc[idx] = cd_pdh | (cd_orh & after_or) | xdn
+
+    entry = _adx_filter(df, entry, adx_min)
+    if adx_min is not None:
+        desc += f" Entries only when ADX >= {adx_min:g}."
+    return {"entry": entry.fillna(False), "exit": exit_.fillna(False),
+            "max_holding_bars": None, "describe": desc}
+
+
 def _fmt_or_end(or_minutes: int) -> str:
     total = 9 * 60 + 30 + or_minutes
     return f"{total // 60:02d}:{total % 60:02d}"
@@ -398,4 +526,5 @@ STRATEGIES = {
     "VWAP + Bollinger": vwap_bollinger,
     "SMA/EMA + DMA": dma_crossover,
     "Opening-range breakout": or_breakout,
+    "Price-action breakout": pa_breakout,
 }
