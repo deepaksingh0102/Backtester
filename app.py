@@ -35,8 +35,9 @@ with st.sidebar:
     st.header("Strategy")
     available = list(strategies.STRATEGIES)
     if not intraday:
-        # Opening-range breakout is intraday-only.
+        # Opening-range breakout and Price-action breakout are intraday-only.
         available.remove("Opening-range breakout")
+        available.remove("Price-action breakout")
     strat_name = st.selectbox("Strategy", available)
     strat_kwargs = {}
     vol_input = lambda: st.number_input(
@@ -128,6 +129,27 @@ with st.sidebar:
         or_minutes = st.number_input("Opening range (minutes)", min_value=5,
                                      max_value=120, value=30, step=5)
         strat_kwargs = {"or_minutes": int(or_minutes)}
+    elif strat_name == "Price-action breakout":
+        relvol_min = st.number_input("Min relative volume", min_value=0.0,
+                                     max_value=10.0, value=1.5, step=0.1,
+                                     help="Session volume so far vs the "
+                                          "prior-20-session average daily "
+                                          "volume, prorated. Needs ~10 "
+                                          "prior sessions in the loaded "
+                                          "window before any entry can fire.")
+        rsi_lo = st.number_input("RSI band low", min_value=0.0, max_value=50.0,
+                                 value=30.0, step=1.0)
+        rsi_hi = st.number_input("RSI band high", min_value=50.0,
+                                 max_value=100.0, value=70.0, step=1.0)
+        wick_max = st.number_input("Max rejection wick (% of crossing candle)",
+                                   min_value=0.0, max_value=100.0, value=50.0,
+                                   step=5.0)
+        or_minutes = st.number_input("Opening range (minutes)", min_value=5,
+                                     max_value=120, value=30, step=5)
+        strat_kwargs = {"relvol_min": float(relvol_min),
+                        "rsi_lo": float(rsi_lo), "rsi_hi": float(rsi_hi),
+                        "wick_max": float(wick_max) / 100.0,
+                        "or_minutes": int(or_minutes)}
 
     st.header("Filters & stops")
     use_adx = st.checkbox("ADX filter — enter only when ADX >= threshold",
